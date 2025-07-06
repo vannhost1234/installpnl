@@ -3,34 +3,34 @@ set -euo pipefail
 
 # === CEK ROOT ===
 if [[ $EUID -ne 0 ]]; then
-   echo "⚠️ Script ini harus dijalankan sebagai root!"
+   echo "⚠️ Harus dijalankan sebagai root!"
    exit 1
 fi
 
-# === INPUT PENGGUNA ===
-read -p "🌐 Masukkan domain panel (cth: panel.vannhost.my.id): " DOMAIN
-read -p "📧 Masukkan email admin: " ADMIN_EMAIL
-read -p "👤 Masukkan username admin: " ADMIN_USER
-read -p "🔐 Masukkan password admin: " ADMIN_PASS
+# === INPUT ===
+read -p "🌐 Domain panel (cth: panel.vannhost.my.id): " DOMAIN
+read -p "📧 Email admin: " ADMIN_EMAIL
+read -p "👤 Username admin: " ADMIN_USER
+read -p "🔐 Password admin: " ADMIN_PASS
+read -p "📦 Hostname VPS ini (cth: node-1): " NODE_NAME
 
-echo "🚀 Mulai install Pterodactyl Panel + Wings untuk $DOMAIN"
+echo "🚀 Mulai setup Pterodactyl Panel + Wings + Node..."
 
-# === UPDATE DAN INSTALL DEPENDENSI ===
+# === DEPENDENSI DASAR ===
 apt update && apt upgrade -y
 apt install -y curl wget zip unzip git nginx mysql-server redis composer ufw software-properties-common lsb-release ca-certificates apt-transport-https gnupg
 
-# === INSTALL PHP 8.1 ===
+# === PHP 8.1 ===
 add-apt-repository ppa:ondrej/php -y
 apt update
-apt install -y php8.1 php8.1-cli php8.1-mbstring php8.1-zip php8.1-bcmath php8.1-tokenizer php8.1-common \
-php8.1-curl php8.1-mysql php8.1-mysqlnd php8.1-xml php8.1-fpm php8.1-gd php8.1-fileinfo php8.1-opcache
+apt install -y php8.1 php8.1-cli php8.1-mysql php8.1-mysqlnd php8.1-xml php8.1-fpm php8.1-curl php8.1-mbstring php8.1-zip php8.1-bcmath php8.1-gd php8.1-fileinfo php8.1-tokenizer php8.1-common
 
 systemctl enable --now nginx mysql redis php8.1-fpm
 
-# === CEK & BUAT SWAP JIKA <2GB RAM ===
+# === SWAPFILE (untuk RAM kecil) ===
 RAM=$(free -m | awk '/^Mem:/{print $2}')
 if [ "$RAM" -lt 2000 ]; then
-    echo "⚠️ RAM kurang dari 2GB, membuat swapfile..."
+    echo "⚠️ RAM <2GB, membuat swapfile..."
     fallocate -l 1G /swapfile
     chmod 600 /swapfile
     mkswap /swapfile
@@ -43,18 +43,16 @@ mkdir -p /var/www/pterodactyl
 cd /var/www/pterodactyl
 curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
 tar -xzvf panel.tar.gz && rm panel.tar.gz
+chown -R www-data:www-data . && chmod -R 755 storage bootstrap/cache
 
-chown -R www-data:www-data /var/www/pterodactyl/*
-chmod -R 755 /var/www/pterodactyl/storage /var/www/pterodactyl/bootstrap/cache
-
-# === SETUP DATABASE ===
+# === DATABASE ===
 DB_PASS=$(openssl rand -hex 16)
-mysql -u root <<MYSQL_SCRIPT
+mysql -u root <<MYSQL
 CREATE DATABASE panel;
 CREATE USER 'pterodactyl'@'localhost' IDENTIFIED BY '${DB_PASS}';
 GRANT ALL PRIVILEGES ON panel.* TO 'pterodactyl'@'localhost';
 FLUSH PRIVILEGES;
-MYSQL_SCRIPT
+MYSQL
 
 # === SETUP PANEL ===
 cp .env.example .env
@@ -62,20 +60,19 @@ composer install --no-dev --optimize-autoloader
 
 php artisan key:generate --force
 php artisan p:environment:setup --email="$ADMIN_EMAIL" --url="https://$DOMAIN" --timezone="Asia/Jakarta" --cache="redis"
-php artisan p:environment:database --host="127.0.0.1" --port="3306" --database="panel" --username="pterodactyl" --password="${DB_PASS}"
-php artisan p:environment:mail --driver="smtp" --host="smtp.mailtrap.io" --port=2525 --username=null --password=null --encryption=null --from="$ADMIN_EMAIL"
+php artisan p:environment:database --host=127.0.0.1 --port=3306 --database=panel --username=pterodactyl --password=${DB_PASS}
+php artisan p:environment:mail --driver=smtp --host=smtp.mailtrap.io --port=2525 --username=null --password=null --encryption=null --from="$ADMIN_EMAIL"
 
 php artisan migrate --seed --force
 php artisan storage:link
 php artisan config:clear
-php artisan p:user:make --email=$ADMIN_EMAIL --username=$ADMIN_USER --name=$ADMIN_USER --password=$ADMIN_PASS --admin=1
+php artisan p:user:make --email="$ADMIN_EMAIL" --username="$ADMIN_USER" --name="$ADMIN_USER" --password="$ADMIN_PASS" --admin=1
 
-# === KONFIG NGINX ===
+# === NGINX CONFIG ===
 cat > /etc/nginx/sites-available/pterodactyl <<EOF
 server {
     listen 80;
     server_name $DOMAIN;
-
     root /var/www/pterodactyl/public;
     index index.php;
 
@@ -108,7 +105,7 @@ ufw allow http
 ufw allow https
 ufw --force enable
 
-# === INSTALL DOCKER + WINGS ===
+# === DOCKER + WINGS ===
 curl -sSL https://get.docker.com/ | sh
 systemctl enable --now docker
 
@@ -118,12 +115,66 @@ curl -Lo wings https://github.com/pterodactyl/wings/releases/latest/download/win
 chmod +x wings
 cp wings /usr/bin/wings
 
+# === AUTO CONFIG wings.yml ===
+PANEL_URL="https://$DOMAIN"
+TOKEN=$(openssl rand -hex 20)
+UUID=$(uuidgen)
+NODE_IP=$(curl -s ipv4.icanhazip.com)
+
+cat > /etc/pterodactyl/config.yml <<EOF
+debug: false
+uuid: $UUID
+token_id: $TOKEN
+token: $(openssl rand -hex 32)
+api:
+  host: 0.0.0.0
+  port: 8080
+  ssl:
+    enabled: false
+system:
+  data: /var/lib/pterodactyl
+  sftp:
+    port: 2022
+    ip: 0.0.0.0
+remote:
+  base: "$PANEL_URL"
+  key: "$TOKEN"
+EOF
+
+useradd -r -m -U -d /etc/pterodactyl -s /bin/false pterodactyl
+chown -R pterodactyl:pterodactyl /etc/pterodactyl
+
+# === SYSTEMD wings.service ===
+cat > /etc/systemd/system/wings.service <<EOF
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings.pid
+ExecStart=/usr/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reexec
+systemctl enable --now wings
+
 # === DONE ===
 echo ""
-echo "✅ Selesai install Pterodactyl Panel + Wings!"
-echo "🌐 Buka: https://$DOMAIN"
+echo "✅ Selesai install Pterodactyl Panel + Wings + Node!"
+echo "🌐 Akses Panel: https://$DOMAIN"
 echo "👤 Username: $ADMIN_USER"
 echo "📧 Email: $ADMIN_EMAIL"
 echo "🔐 Password: $ADMIN_PASS"
-echo "🛠️ MySQL Password: $DB_PASS"
-echo "📌 Login ke panel, setup node, dan upload config wings ke: /etc/pterodactyl/config.yml"
+echo "📦 Node name: $NODE_NAME"
+echo "📍 Wings config: /etc/pterodactyl/config.yml"
+echo "⚙️  Wings Status: systemctl status wings"
